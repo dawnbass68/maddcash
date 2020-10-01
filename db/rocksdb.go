@@ -1,0 +1,696 @@
+package db
+
+import (
+	"blockbook/bchain"
+	"bytes"
+	"encoding/binary"
+	"encoding/hex"
+	"math"
+	"os"
+	"path/filepath"
+
+	"github.com/juju/errors"
+
+	"github.com/bsm/go-vlq"
+	"github.com/golang/glog"
+
+	"github.com/tecbot/gorocksdb"
+)
+
+// iterator creates snapshot, which takes lots of resources
+// when doing huge scan, it is better to close it and reopen from time to time to free the resources
+const disconnectBlocksRefreshIterator = uint64(1000000)
+
+func RepairRocksDB(name string) error {
+	glog.Infof("rocksdb: repair")
+	opts := gorocksdb.NewDefaultOptions()
+	return gorocksdb.RepairDb(name, opts)
+}
+
+// RocksDB handle
+type RocksDB struct {
+	path        string
+	db          *gorocksdb.DB
+	wo          *gorocksdb.WriteOptions
+	ro          *gorocksdb.ReadOptions
+	cfh         []*gorocksdb.ColumnFamilyHandle
+	chainParser bchain.BlockChainParser
+}
+
+const (
+	cfDefault = iota
+	cfHeight
+	cfOutputs
+	cfInputs
+	cfTransactions
+)
+
+var cfNames = []string{"default", "height", "outputs", "inputs", "transactions"}
+
+func openDB(path string) (*gorocksdb.DB, []*gorocksdb.ColumnFamilyHandle, error) {
+	c := gorocksdb.NewLRUCache(8 << 30) // 8GB
+	fp := gorocksdb.NewBloomFilter(10)
+	bbto := gorocksdb.NewDefaultBlockBasedTableOptions()
+	bbto.SetBlockSize(16 << 10) // 16kB
+	bbto.SetBlockCache(c)
+	bbto.SetFilterPolicy(fp)
+
+	opts := gorocksdb.NewDefaultOptions()
+	opts.SetBlockBasedTableFactory(bbto)
+	opts.SetCreateIfMissing(true)
+	opts.SetCreateIfMissingColumnFamilies(true)
+	opts.SetMaxBackgroundCompactions(4)
+	opts.SetMaxBackgroundFlushes(2)
+	opts.SetBytesPerSync(1 << 20)    // 1MB
+	opts.SetWriteBufferSize(1 << 27) // 128MB
+	opts.SetMaxOpenFiles(25000)
+	opts.SetCompression(gorocksdb.NoCompression)
+
+	// opts for outputs are different:
+	// no bloom filter - from documentation: If most of your queries are executed using iterators, you shouldn't set bloom filter
+	bbtoOutputs := gorocksdb.NewDefaultBlockBasedTableOptions()
+	bbtoOutputs.SetBlockSize(16 << 10) // 16kB
+	bbtoOutputs.SetBlockCache(c)       // 8GB
+
+	optsOutputs := gorocksdb.NewDefaultOptions()
+	optsOutputs.SetBlockBasedTableFactory(bbtoOutputs)
+	optsOutputs.SetCreateIfMissing(true)
+	optsOutputs.SetCreateIfMissingColumnFamilies(true)
+	optsOutputs.SetMaxBackgroundCompactions(4)
+	optsOutputs.SetMaxBackgroundFlushes(2)
+	optsOutputs.SetBytesPerSync(1 << 20)    // 1MB
+	optsOutputs.SetWriteBufferSize(1 << 27) // 128MB
+	optsOutputs.SetMaxOpenFiles(25000)
+	optsOutputs.SetCompression(gorocksdb.NoCompression)
+
+	fcOptions := []*gorocksdb.Options{opts, opts, optsOutputs, opts, opts}
+
+	db, cfh, err := gorocksdb.OpenDbColumnFamilies(opts, path, cfNames, fcOptions)
+	if err != nil {
+		return nil, nil, err
+	}
+	return db, cfh, nil
+}
+
+// NewRocksDB opens an internal handle to RocksDB environment.  Close
+// needs to be called to release it.
+func NewRocksDB(path string, parser bchain.BlockChainParser) (d *RocksDB, err error) {
+	glog.Infof("rocksdb: open %s", path)
+	db, cfh, err := openDB(path)
+	wo := gorocksdb.NewDefaultWriteOptions()
+	ro := gorocksdb.NewDefaultReadOptions()
+	ro.SetFillCache(false)
+	return &RocksDB{path, db, wo, ro, cfh, parser}, nil
+}
+
+func (d *RocksDB) closeDB() error {
+	for _, h := range d.cfh {
+		h.Destroy()
+	}
+	d.db.Close()
+	return nil
+}
+
+// Close releases the RocksDB environment opened in NewRocksDB.
+func (d *RocksDB) Close() error {
+	glog.Infof("rocksdb: close")
+	d.closeDB()
+	d.wo.Destroy()
+	d.ro.Destroy()
+	return nil
+}
+
+// Reopen reopens the database
+// It closes and reopens db, nobody can access the database during the operation!
+func (d *RocksDB) Reopen() error {
+	err := d.closeDB()
+	if err != nil {
+		return err
+	}
+	d.db = nil
+	db, cfh, err := openDB(d.path)
+	if err != nil {
+		return err
+	}
+	d.db, d.cfh = db, cfh
+	return nil
+}
+
+// GetTransactions finds all input/output transactions for address
+// Transaction are passed to callback function.
+func (d *RocksDB) GetTransactions(address string, lower uint32, higher uint32, fn func(txid string, vout uint32, isOutput bool) error) (err error) {
+	if glog.V(1) {
+		glog.Infof("rocksdb: address get %s %d-%d ", address, lower, higher)
+	}
+	addrID, err := d.chainParser.GetAddrIDFromAddress(address)
+	if err != nil {
+		return err
+	}
+
+	kstart, err := packOutputKey(addrID, lower)
+	if err != nil {
+		return err
+	}
+	kstop, err := packOutputKey(addrID, higher)
+	if err != nil {
+		return err
+	}
+
+	it := d.db.NewIteratorCF(d.ro, d.cfh[cfOutputs])
+	defer it.Close()
+
+	isUTXO := d.chainParser.IsUTXOChain()
+
+	for it.Seek(kstart); it.Valid(); it.Next() {
+		key := it.Key().Data()
+		val := it.Value().Data()
+		if bytes.Compare(key, kstop) > 0 {
+			break
+		}
+		outpoints, err := d.unpackOutputValue(val)
+		if err != nil {
+			return err
+		}
+		if glog.V(2) {
+			glog.Infof("rocksdb: output %s: %s", hex.EncodeToString(key), hex.EncodeToString(val))
+		}
+		for _, o := range outpoints {
+			var vout uint32
+			var isOutput bool
+			if o.vout < 0 {
+				vout = uint32(^o.vout)
+				isOutput = false
+			} else {
+				vout = uint32(o.vout)
+				isOutput = true
+			}
+			if err := fn(o.txid, vout, isOutput); err != nil {
+				return err
+			}
+			if isUTXO {
+				stxid, so, err := d.GetSpentOutput(o.txid, o.vout)
+				if err != nil {
+					return err
+				}
+				if stxid != "" {
+					if glog.V(2) {
+						glog.Infof("rocksdb: input %s/%d: %s/%d", o.txid, o.vout, stxid, so)
+					}
+					if err := fn(stxid, uint32(so), false); err != nil {
+						return err
+					}
+				}
+			}
+		}
+	}
+	return nil
+}
+
+const (
+	opInsert = 0
+	opDelete = 1
+)
+
+func (d *RocksDB) ConnectBlock(block *bchain.Block) error {
+	return d.writeBlock(block, opInsert)
+}
+
+func (d *RocksDB) DisconnectBlock(block *bchain.Block) error {
+	return d.writeBlock(block, opDelete)
+}
+
+func (d *RocksDB) writeBlock(block *bchain.Block, op int) error {
+	wb := gorocksdb.NewWriteBatch()
+	defer wb.Destroy()
+
+	if glog.V(2) {
+		switch op {
+		case opInsert:
+			glog.Infof("rocksdb: insert %d %s", block.Height, block.Hash)
+		case opDelete:
+			glog.Infof("rocksdb: delete %d %s", block.Height, block.Hash)
+		}
+	}
+
+	isUTXO := d.chainParser.IsUTXOChain()
+
+	if err := d.writeHeight(wb, block, op); err != nil {
+		return err
+	}
+	if err := d.writeOutputs(wb, block, op, isUTXO); err != nil {
+		return err
+	}
+	if isUTXO {
+		if err := d.writeInputs(wb, block, op); err != nil {
+			return err
+		}
+	}
+
+	return d.db.Write(d.wo, wb)
+}
+
+// Output Index
+
+type outpoint struct {
+	txid string
+	vout int32
+}
+
+func (d *RocksDB) addAddrIDToRecords(op int, wb *gorocksdb.WriteBatch, records map[string][]outpoint, addrID []byte, txid string, vout int32, bh uint32) error {
+	if len(addrID) > 0 {
+		if len(addrID) > 1024 {
+			glog.Infof("block %d, skipping addrID of length %d", bh, len(addrID))
+		} else {
+			strAddrID := string(addrID)
+			records[strAddrID] = append(records[strAddrID], outpoint{
+				txid: txid,
+				vout: vout,
+			})
+			if op == opDelete {
+				// remove transactions from cache
+				b, err := d.chainParser.PackTxid(txid)
+				if err != nil {
+					return err
+				}
+				wb.DeleteCF(d.cfh[cfTransactions], b)
+			}
+		}
+	}
+	return nil
+}
+
+func (d *RocksDB) writeOutputs(wb *gorocksdb.WriteBatch, block *bchain.Block, op int, isUTXO bool) error {
+	records := make(map[string][]outpoint)
+
+	for _, tx := range block.Txs {
+		for _, output := range tx.Vout {
+			addrID, err := d.chainParser.GetAddrIDFromVout(&output)
+			if err != nil {
+				// do not log ErrAddressMissing, transactions can be without to address (for example eth contracts)
+				if err != bchain.ErrAddressMissing {
+					glog.Warningf("rocksdb: addrID: %v - height %d, tx %v, output %v", err, block.Height, tx.Txid, output)
+				}
+				continue
+			}
+			err = d.addAddrIDToRecords(op, wb, records, addrID, tx.Txid, int32(output.N), block.Height)
+			if err != nil {
+				return err
+			}
+		}
+		if !isUTXO {
+			// store inputs in output column in format txid ^index
+			for _, input := range tx.Vin {
+				for i, a := range input.Addresses {
+					addrID, err := d.chainParser.GetAddrIDFromAddress(a)
+					if err != nil {
+						glog.Warningf("rocksdb: addrID: %v - %d %s", err, block.Height, addrID)
+						continue
+					}
+					err = d.addAddrIDToRecords(op, wb, records, addrID, tx.Txid, int32(^i), block.Height)
+					if err != nil {
+						return err
+					}
+				}
+			}
+		}
+	}
+
+	for addrID, outpoints := range records {
+		key, err := packOutputKey([]byte(addrID), block.Height)
+		if err != nil {
+			glog.Warningf("rocksdb: packOutputKey: %v - %d %s", err, block.Height, addrID)
+			continue
+		}
+
+		switch op {
+		case opInsert:
+			val, err := d.packOutputValue(outpoints)
+			if err != nil {
+				glog.Warningf("rocksdb: packOutputValue: %v", err)
+				continue
+			}
+			wb.PutCF(d.cfh[cfOutputs], key, val)
+		case opDelete:
+			wb.DeleteCF(d.cfh[cfOutputs], key)
+		}
+	}
+
+	return nil
+}
+
+func packOutputKey(outputScript []byte, height uint32) ([]byte, error) {
+	bheight := packUint(height)
+	buf := make([]byte, 0, len(outputScript)+len(bheight))
+	buf = append(buf, outputScript...)
+	buf = append(buf, bheight...)
+	return buf, nil
+}
+
+func (d *RocksDB) packOutputValue(outpoints []outpoint) ([]byte, error) {
+	buf := make([]byte, 0)
+	for _, o := range outpoints {
+		btxid, err := d.chainParser.PackTxid(o.txid)
+		if err != nil {
+			return nil, err
+		}
+		bvout := packVarint(o.vout)
+		buf = append(buf, btxid...)
+		buf = append(buf, bvout...)
+	}
+	return buf, nil
+}
+
+func (d *RocksDB) unpackOutputValue(buf []byte) ([]outpoint, error) {
+	txidUnpackedLen := d.chainParser.PackedTxidLen()
+	outpoints := make([]outpoint, 0)
+	for i := 0; i < len(buf); {
+		txid, err := d.chainParser.UnpackTxid(buf[i : i+txidUnpackedLen])
+		if err != nil {
+			return nil, err
+		}
+		i += txidUnpackedLen
+		vout, voutLen := unpackVarint(buf[i:])
+		i += voutLen
+		outpoints = append(outpoints, outpoint{
+			txid: txid,
+			vout: vout,
+		})
+	}
+	return outpoints, nil
+}
+
+// Input index
+
+func (d *RocksDB) writeInputs(
+	wb *gorocksdb.WriteBatch,
+	block *bchain.Block,
+	op int,
+) error {
+	for _, tx := range block.Txs {
+		for i, input := range tx.Vin {
+			if input.Coinbase != "" {
+				continue
+			}
+			key, err := d.packOutpoint(input.Txid, int32(input.Vout))
+			if err != nil {
+				return err
+			}
+			val, err := d.packOutpoint(tx.Txid, int32(i))
+			if err != nil {
+				return err
+			}
+			switch op {
+			case opInsert:
+				wb.PutCF(d.cfh[cfInputs], key, val)
+			case opDelete:
+				wb.DeleteCF(d.cfh[cfInputs], key)
+			}
+		}
+	}
+	return nil
+}
+
+func (d *RocksDB) packOutpoint(txid string, vout int32) ([]byte, error) {
+	btxid, err := d.chainParser.PackTxid(txid)
+	if err != nil {
+		return nil, err
+	}
+	bvout := packVarint(vout)
+	buf := make([]byte, 0, len(btxid)+len(bvout))
+	buf = append(buf, btxid...)
+	buf = append(buf, bvout...)
+	return buf, nil
+}
+
+func (d *RocksDB) unpackOutpoint(buf []byte) (string, int32, int) {
+	txidUnpackedLen := d.chainParser.PackedTxidLen()
+	txid, _ := d.chainParser.UnpackTxid(buf[:txidUnpackedLen])
+	vout, o := unpackVarint(buf[txidUnpackedLen:])
+	return txid, vout, txidUnpackedLen + o
+}
+
+// Block index
+
+// GetBestBlock returns the block hash of the block with highest height in the db
+func (d *RocksDB) GetBestBlock() (uint32, string, error) {
+	it := d.db.NewIteratorCF(d.ro, d.cfh[cfHeight])
+	defer it.Close()
+	if it.SeekToLast(); it.Valid() {
+		bestHeight := unpackUint(it.Key().Data())
+		val, err := d.chainParser.UnpackBlockHash(it.Value().Data())
+		if glog.V(1) {
+			glog.Infof("rocksdb: bestblock %d %s", bestHeight, val)
+		}
+		return bestHeight, val, err
+	}
+	return 0, "", nil
+}
+
+// GetBlockHash returns block hash at given height or empty string if not found
+func (d *RocksDB) GetBlockHash(height uint32) (string, error) {
+	key := packUint(height)
+	val, err := d.db.GetCF(d.ro, d.cfh[cfHeight], key)
+	if err != nil {
+		return "", err
+	}
+	defer val.Free()
+	return d.chainParser.UnpackBlockHash(val.Data())
+}
+
+// GetSpentOutput returns output which is spent by input tx
+func (d *RocksDB) GetSpentOutput(txid string, i int32) (string, int32, error) {
+	b, err := d.packOutpoint(txid, i)
+	if err != nil {
+		return "", 0, err
+	}
+	val, err := d.db.GetCF(d.ro, d.cfh[cfInputs], b)
+	if err != nil {
+		return "", 0, err
+	}
+	defer val.Free()
+	p, err := d.unpackOutputValue(val.Data())
+	if err != nil {
+		return "", 0, err
+	}
+	var otxid string
+	var oi int32
+	for _, i := range p {
+		otxid, oi = i.txid, i.vout
+		break
+	}
+	return otxid, oi, nil
+}
+
+func (d *RocksDB) writeHeight(
+	wb *gorocksdb.WriteBatch,
+	block *bchain.Block,
+	op int,
+) error {
+	key := packUint(block.Height)
+
+	switch op {
+	case opInsert:
+		val, err := d.chainParser.PackBlockHash(block.Hash)
+		if err != nil {
+			return err
+		}
+		wb.PutCF(d.cfh[cfHeight], key, val)
+	case opDelete:
+		wb.DeleteCF(d.cfh[cfHeight], key)
+	}
+
+	return nil
+}
+
+// DisconnectBlocksFullScan removes all data belonging to blocks in range lower-higher
+// it finds the data by doing full scan of outputs column, therefore it is quite slow
+func (d *RocksDB) DisconnectBlocksFullScan(lower uint32, higher uint32) error {
+	glog.Infof("db: disconnecting blocks %d-%d using full scan", lower, higher)
+	outputKeys := [][]byte{}
+	outputValues := [][]byte{}
+	var totalOutputs, count uint64
+	var seekKey []byte
+	for {
+		var key []byte
+		it := d.db.NewIteratorCF(d.ro, d.cfh[cfOutputs])
+		if totalOutputs == 0 {
+			it.SeekToFirst()
+		} else {
+			it.Seek(seekKey)
+			it.Next()
+		}
+		for count = 0; it.Valid() && count < disconnectBlocksRefreshIterator; it.Next() {
+			totalOutputs++
+			count++
+			key = it.Key().Data()
+			l := len(key)
+			if l > 4 {
+				height := unpackUint(key[l-4 : l])
+				if height >= lower && height <= higher {
+					outputKey := make([]byte, len(key))
+					copy(outputKey, key)
+					outputKeys = append(outputKeys, outputKey)
+					value := it.Value().Data()
+					outputValue := make([]byte, len(value))
+					copy(outputValue, value)
+					outputValues = append(outputValues, outputValue)
+				}
+			}
+		}
+		seekKey = make([]byte, len(key))
+		copy(seekKey, key)
+		valid := it.Valid()
+		it.Close()
+		if !valid {
+			break
+		}
+	}
+	glog.Infof("rocksdb: about to disconnect %d outputs from %d", len(outputKeys), totalOutputs)
+	wb := gorocksdb.NewWriteBatch()
+	defer wb.Destroy()
+	for i := 0; i < len(outputKeys); i++ {
+		if glog.V(2) {
+			glog.Info("output ", hex.EncodeToString(outputKeys[i]))
+		}
+		wb.DeleteCF(d.cfh[cfOutputs], outputKeys[i])
+		outpoints, err := d.unpackOutputValue(outputValues[i])
+		if err != nil {
+			return err
+		}
+		for _, o := range outpoints {
+			// delete from inputs
+			boutpoint, err := d.packOutpoint(o.txid, o.vout)
+			if err != nil {
+				return err
+			}
+			if glog.V(2) {
+				glog.Info("input ", hex.EncodeToString(boutpoint))
+			}
+			wb.DeleteCF(d.cfh[cfInputs], boutpoint)
+			// delete from txCache
+			b, err := d.chainParser.PackTxid(o.txid)
+			if err != nil {
+				return err
+			}
+			wb.DeleteCF(d.cfh[cfTransactions], b)
+		}
+	}
+	for height := lower; height <= higher; height++ {
+		if glog.V(2) {
+			glog.Info("height ", height)
+		}
+		wb.DeleteCF(d.cfh[cfHeight], packUint(height))
+	}
+	err := d.db.Write(d.wo, wb)
+	if err == nil {
+		glog.Infof("rocksdb: blocks %d-%d disconnected", lower, higher)
+	}
+	return err
+}
+
+func dirSize(path string) (int64, error) {
+	var size int64
+	err := filepath.Walk(path, func(_ string, info os.FileInfo, err error) error {
+		if !info.IsDir() {
+			size += info.Size()
+		}
+		return err
+	})
+	return size, err
+}
+
+// DatabaseSizeOnDisk returns size of the database in bytes
+func (d *RocksDB) DatabaseSizeOnDisk() int64 {
+	size, err := dirSize(d.path)
+	if err != nil {
+		glog.Error("rocksdb: DatabaseSizeOnDisk: ", err)
+		return 0
+	}
+	return size
+}
+
+// GetTx returns transaction stored in db and height of the block containing it
+func (d *RocksDB) GetTx(txid string) (*bchain.Tx, uint32, error) {
+	key, err := d.chainParser.PackTxid(txid)
+	if err != nil {
+		return nil, 0, err
+	}
+	val, err := d.db.GetCF(d.ro, d.cfh[cfTransactions], key)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer val.Free()
+	data := val.Data()
+	if len(data) > 4 {
+		return d.chainParser.UnpackTx(data)
+	}
+	return nil, 0, nil
+}
+
+// PutTx stores transactions in db
+func (d *RocksDB) PutTx(tx *bchain.Tx, height uint32, blockTime int64) error {
+	key, err := d.chainParser.PackTxid(tx.Txid)
+	if err != nil {
+		return nil
+	}
+	buf, err := d.chainParser.PackTx(tx, height, blockTime)
+	if err != nil {
+		return err
+	}
+	return d.db.PutCF(d.wo, d.cfh[cfTransactions], key, buf)
+}
+
+// DeleteTx removes transactions from db
+func (d *RocksDB) DeleteTx(txid string) error {
+	key, err := d.chainParser.PackTxid(txid)
+	if err != nil {
+		return nil
+	}
+	return d.db.DeleteCF(d.wo, d.cfh[cfTransactions], key)
+}
+
+// Helpers
+
+var ErrInvalidAddress = errors.New("invalid address")
+
+func packUint(i uint32) []byte {
+	buf := make([]byte, 4)
+	binary.BigEndian.PutUint32(buf, i)
+	return buf
+}
+
+func unpackUint(buf []byte) uint32 {
+	return binary.BigEndian.Uint32(buf)
+}
+
+func packFloat64(f float64) []byte {
+	buf := make([]byte, 8)
+	binary.BigEndian.PutUint64(buf, math.Float64bits(f))
+	return buf
+}
+
+func unpackFloat64(buf []byte) float64 {
+	return math.Float64frombits(binary.BigEndian.Uint64(buf))
+}
+
+func packVarint(i int32) []byte {
+	buf := make([]byte, vlq.MaxLen32)
+	ofs := vlq.PutInt(buf, int64(i))
+	return buf[:ofs]
+}
+
+func unpackVarint(buf []byte) (int32, int) {
+	i, ofs := vlq.Uint(buf)
+	return int32(i), ofs
+}
+
+func packVarint64(i int64) []byte {
+	buf := make([]byte, vlq.MaxLen64)
+	ofs := vlq.PutInt(buf, i)
+	return buf[:ofs]
+}
+
+func unpackVarint64(buf []byte) (int64, int) {
+	i, ofs := vlq.Int(buf)
+	return i, ofs
+}
