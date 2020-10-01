@@ -1,0 +1,8 @@
+vendor/
+data*/
+profile/
+blockbook
+notes.txt
+debug*
+.vscode
+docker/blockbook
