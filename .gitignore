@@ -1,0 +1,13 @@
+vendor/
+data*/
+profile/
+blockbook
+notes.txt
+debug*
+.vscode
+docker/blockbook
+build
+!build/templates
+!build/docker
+.bin-image
+.deb-image
